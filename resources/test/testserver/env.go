@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,11 +28,14 @@ import (
 	mobynetwork "github.com/moby/moby/api/types/network"
 	"github.com/techorionai/constellation-platform-go/auth/clientcred"
 	platformconfig "github.com/techorionai/constellation-platform-go/config"
+	"github.com/techorionai/constellation-platform-go/resources/test/containers"
+	streamsvalkey "github.com/techorionai/constellation-platform-go/streams/valkey"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcvalkey "github.com/testcontainers/testcontainers-go/modules/valkey"
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
+	valkeygo "github.com/valkey-io/valkey-go"
 )
 
 // The images of the tests. PostgreSQL and Valkey are the same as in
@@ -39,7 +43,7 @@ import (
 const (
 	PostgresImage = "postgres:18.7-alpine"
 	ValkeyImage   = "valkey/valkey:9.0.7-alpine"
-	IdentityImage = "ghcr.io/techorionai/constellation-identity:0.7.0"
+	IdentityImage = "ghcr.io/techorionai/constellation-identity:0.7.1"
 )
 
 // Passwords of the throwaway containers.
@@ -392,3 +396,45 @@ func (e *Env) ContainerEnv(t testing.TB) map[string]string {
 
 // Network returns the name of the container network.
 func (e *Env) NetworkName() string { return e.Network.Name }
+
+// ValkeyAdmin returns a client of the default user of Valkey. The user has all
+// rights. It closes the client at cleanup.
+func (e *Env) ValkeyAdmin(t testing.TB) valkeygo.Client {
+	t.Helper()
+	c, err := valkeygo.NewClient(valkeygo.ClientOption{
+		InitAddress: []string{e.ValkeyAddress(t)}, Password: vkPassword, DisableCache: true,
+	})
+	if err != nil {
+		t.Fatalf("testserver: valkey admin client: %v", err)
+	}
+	t.Cleanup(c.Close)
+	return c
+}
+
+// ACLSelectors returns the two ACL selectors of the user of the events service
+// as separate texts, each in parentheses.
+func ACLSelectors() []string {
+	return regexp.MustCompile(`\([^)]*\)`).FindAllString(streamsvalkey.ACLSelectors("events"), -1)
+}
+
+// NewValkeyACLUser makes an ACL user like the user of the events service in
+// production. It has the key pattern ~events:*, the command rule of
+// platform-go, and the two stream selectors. It returns the name and the
+// password.
+func (e *Env) NewValkeyACLUser(t testing.TB) (string, string) {
+	t.Helper()
+	e.mu.Lock()
+	e.dbSeq++
+	n := e.dbSeq
+	e.mu.Unlock()
+	user := fmt.Sprintf("events_acl_%d_%d", time.Now().UnixNano(), n)
+	password := fmt.Sprintf("pw%d", time.Now().UnixNano())
+	args := []string{"ACL", "SETUSER", user, "on", ">" + password, "~events:*"}
+	args = append(args, strings.Fields(containers.ACLRule)...)
+	args = append(args, ACLSelectors()...)
+	admin := e.ValkeyAdmin(t)
+	if err := admin.Do(context.Background(), admin.B().Arbitrary(args[0]).Args(args[1:]...).Build()).Error(); err != nil {
+		t.Fatalf("testserver: ACL SETUSER: %v", err)
+	}
+	return user, password
+}

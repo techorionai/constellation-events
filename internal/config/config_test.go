@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/techorionai/constellation-events/internal/config"
 )
@@ -62,5 +63,38 @@ func TestMissingVariable(t *testing.T) {
 	_, err := config.Load()
 	if err == nil || !strings.Contains(err.Error(), "AUTH__ISSUER") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+// U13: the interval has a default and limits. A bad value gives an error that
+// names the variable.
+func TestU13_LagInterval(t *testing.T) {
+	setRequired(t)
+	cases := []struct {
+		value string
+		want  time.Duration
+		bad   bool
+	}{
+		{"", 30 * time.Second, false},
+		{"5s", 5 * time.Second, false},
+		{"2m", 2 * time.Minute, false},
+		{"4s", 0, true},
+		{"3m", 0, true},
+		{"abc", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("EVENTS_LAG__INTERVAL", tc.value)
+			cfg, err := config.Load()
+			if tc.bad {
+				if err == nil || !strings.Contains(err.Error(), "EVENTS_LAG__INTERVAL") {
+					t.Fatalf("error = %v", err)
+				}
+				return
+			}
+			if err != nil || cfg.Lag.Interval != tc.want {
+				t.Fatalf("interval = %v, error = %v", cfg.Lag.Interval, err)
+			}
+		})
 	}
 }

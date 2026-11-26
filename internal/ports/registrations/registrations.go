@@ -38,6 +38,9 @@ type Repository interface {
 	// ListRegistrations returns at most limit registrations after the app
 	// "after", in the order of the app. Each has the types with no removal time.
 	ListRegistrations(ctx context.Context, after string, limit int) ([]domain.StoredRegistration, error)
+	// ListApps returns the app of each registration, sorted. It has no limit,
+	// because the lag collector needs all streams.
+	ListApps(ctx context.Context) ([]string, error)
 	// GetRegistration returns the registration of one app, or ErrNotFound.
 	GetRegistration(ctx context.Context, app string) (domain.StoredRegistration, error)
 	// ListTypes returns at most limit types in the order of the type.

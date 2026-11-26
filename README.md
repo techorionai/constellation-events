@@ -9,6 +9,7 @@ Events do not go through this service. They go through the outbox and the Valkey
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [Event catalog](docs/event-catalog.md)
+- [Consumer lag](docs/consumer-lag.md)
 - [Development](docs/development.md)
 
 ## Quick start

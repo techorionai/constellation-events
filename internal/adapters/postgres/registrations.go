@@ -322,3 +322,24 @@ func (r *Registrations) GetRegistration(ctx context.Context, app string) (domain
 	}
 	return s, wrap("get registration types", rows.Err())
 }
+
+// ListApps returns the app of each registration, sorted.
+func (r *Registrations) ListApps(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT app FROM registrations ORDER BY app`)
+	if err != nil {
+		return nil, wrap("list apps", err)
+	}
+	defer rows.Close()
+	apps := []string{}
+	for rows.Next() {
+		var app string
+		if err := rows.Scan(&app); err != nil {
+			return nil, wrap("scan app", err)
+		}
+		apps = append(apps, app)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrap("list apps", err)
+	}
+	return apps, nil
+}
