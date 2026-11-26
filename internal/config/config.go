@@ -31,6 +31,19 @@ const (
 	MaxMaxBodyBytes     = 16 << 20
 )
 
+// Limits of the lag interval. The maximum gives two or more collections in the
+// window of 5 minutes of the default alert for the collection time.
+const (
+	DefaultLagInterval = 30 * time.Second
+	MinLagInterval     = 5 * time.Second
+	MaxLagInterval     = 2 * time.Minute
+)
+
+// Lag is the config of the consumer lag worker.
+type Lag struct {
+	Interval time.Duration `env:"INTERVAL" envDefault:"30s"`
+}
+
 // HTTP is the config of the public listener.
 type HTTP struct {
 	Addr string `env:"ADDR" envDefault:":8080"`
@@ -72,6 +85,7 @@ type Config struct {
 	Auth         Auth              `envPrefix:"AUTH__"`
 	Client       clientcred.Config `envPrefix:"CLIENT__"`
 	Identity     identity.Config   `envPrefix:"IDENTITY__"`
+	Lag          Lag               `envPrefix:"LAG__"`
 	MaxBodyBytes int64             `env:"MAX_BODY_BYTES" envDefault:"4194304"`
 }
 
@@ -92,6 +106,9 @@ func (c Config) Validate() error {
 	var errs []error
 	if c.MaxBodyBytes < MinMaxBodyBytes || c.MaxBodyBytes > MaxMaxBodyBytes {
 		errs = append(errs, fmt.Errorf("%sMAX_BODY_BYTES: must be from %d to %d", Prefix, MinMaxBodyBytes, MaxMaxBodyBytes))
+	}
+	if c.Lag.Interval < MinLagInterval || c.Lag.Interval > MaxLagInterval {
+		errs = append(errs, fmt.Errorf("%sLAG__INTERVAL: must be from %s to %s", Prefix, MinLagInterval, MaxLagInterval))
 	}
 	return errors.Join(errs...)
 }

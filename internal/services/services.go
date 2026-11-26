@@ -27,20 +27,25 @@ import (
 	migratepg "github.com/techorionai/constellation-platform-go/migrate/postgres"
 	"github.com/techorionai/constellation-platform-go/requestid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/techorionai/constellation-events/api/openapi"
 	"github.com/techorionai/constellation-events/internal/adapters/postgres"
+	vkadapter "github.com/techorionai/constellation-events/internal/adapters/valkey"
 	"github.com/techorionai/constellation-events/internal/app/commands"
 	"github.com/techorionai/constellation-events/internal/app/queries"
 	apperrors "github.com/techorionai/constellation-events/internal/common/errors"
 	"github.com/techorionai/constellation-events/internal/config"
 	httpapi "github.com/techorionai/constellation-events/internal/handlers/http"
+	"github.com/techorionai/constellation-events/internal/handlers/worker/lag"
 	"github.com/techorionai/constellation-events/migrations"
 )
 
 type options struct {
 	log   *slog.Logger
 	clock func() time.Time
+	meter metric.MeterProvider
 }
 
 // Option changes the composition. The options are for tests. Production code
@@ -52,6 +57,10 @@ func WithLogger(l *slog.Logger) Option { return func(o *options) { o.log = l } }
 
 // WithClock sets the clock of the registration command.
 func WithClock(now func() time.Time) Option { return func(o *options) { o.clock = now } }
+
+// WithMeterProvider sets the meter provider of the lag instruments. The default
+// is the global provider.
+func WithMeterProvider(mp metric.MeterProvider) Option { return func(o *options) { o.meter = mp } }
 
 func newOptions(opts []Option) options {
 	o := options{log: slog.Default()}
@@ -77,6 +86,10 @@ type App struct {
 
 	stopPublisher context.CancelFunc
 	publisherWG   sync.WaitGroup
+
+	stopLag context.CancelFunc
+	lagWG   sync.WaitGroup
+	lag     *lag.Worker
 
 	serveWG   sync.WaitGroup
 	closeOnce sync.Once
@@ -181,7 +194,14 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 	}
 	migrated.Store(true)
 
-	// 4. Publish the own manifest in the background. A producer gets a token
+	// 4. Register the lag instruments and start the lag worker. It reads the
+	// registrations table, thus it starts after the migrations.
+	repo := postgres.New(a.db.Pool)
+	if err := a.startLag(ctx, repo, o); err != nil {
+		return nil, err
+	}
+
+	// 5. Publish the own manifest in the background. A producer gets a token
 	// for the audience events only after this publish.
 	pubCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	a.stopPublisher = stop
@@ -193,8 +213,7 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 		}
 	}()
 
-	// 5. Make the use cases and start the public server.
-	repo := postgres.New(a.db.Pool)
+	// 6. Make the use cases and start the public server.
 	register, err := commands.NewRegisterEventTypes(repo, log, o.clock)
 	if err != nil {
 		return nil, err
@@ -278,6 +297,13 @@ func (a *App) release(ctx context.Context) {
 			a.stopPublisher()
 			a.publisherWG.Wait()
 		}
+		if a.stopLag != nil {
+			a.stopLag()
+			waitTimeout(&a.lagWG, 5*time.Second)
+		}
+		if a.lag != nil {
+			_ = a.lag.Close()
+		}
 		if a.verify != nil {
 			a.verify.Close()
 		}
@@ -315,4 +341,50 @@ func RunMigrations(ctx context.Context, db *clientpg.Client) error {
 		return fmt.Errorf("run the migrations: %w", err)
 	}
 	return nil
+}
+
+// startLag registers the lag instruments and starts the lag worker in a
+// goroutine.
+func (a *App) startLag(ctx context.Context, repo *postgres.Registrations, o options) error {
+	interval := a.cfg.Lag.Interval
+	if interval <= 0 {
+		interval = config.DefaultLagInterval
+	}
+	mp := o.meter
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	collect := queries.NewCollectConsumerLag(repo, vkadapter.NewStreams(a.kv.Raw))
+	observe := []decorators.Option{decorators.WithLogger(a.log)}
+	w, err := lag.New(lag.Config{
+		Collect:  decorators.ApplyTracing(decorators.ApplyLogging(collect, "CollectConsumerLag", observe...), "CollectConsumerLag"),
+		Interval: interval,
+		Meter:    mp.Meter("events"),
+		Log:      a.log,
+	})
+	if err != nil {
+		return fmt.Errorf("make the lag worker: %w", err)
+	}
+	a.lag = w
+	lagCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	a.stopLag = stop
+	a.lagWG.Add(1)
+	go func() {
+		defer a.lagWG.Done()
+		w.Run(lagCtx)
+	}()
+	return nil
+}
+
+// waitTimeout waits for the group, for at most d.
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+	}
 }
