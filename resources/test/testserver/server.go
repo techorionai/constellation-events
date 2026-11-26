@@ -14,6 +14,8 @@ import (
 
 	clientpg "github.com/techorionai/constellation-platform-go/clients/postgres"
 	clientvk "github.com/techorionai/constellation-platform-go/clients/valkey"
+	platformconfig "github.com/techorionai/constellation-platform-go/config"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/techorionai/constellation-events/internal/config"
 	"github.com/techorionai/constellation-events/internal/services"
@@ -25,6 +27,9 @@ type settings struct {
 	maxBodyBytes int64
 	client       string
 	configure    []func(*config.Config)
+	meter        metric.MeterProvider
+	lagInterval  time.Duration
+	valkeyACL    bool
 }
 
 // Option changes a test server.
@@ -39,6 +44,17 @@ func WithLogger(l *slog.Logger) Option { return func(s *settings) { s.logger = l
 // WithMaxBodyBytes sets the body limit of the registration.
 func WithMaxBodyBytes(n int64) Option { return func(s *settings) { s.maxBodyBytes = n } }
 
+// WithMeterProvider sets the meter provider of the lag instruments.
+func WithMeterProvider(mp metric.MeterProvider) Option { return func(s *settings) { s.meter = mp } }
+
+// WithLagInterval sets the interval of the lag worker. The default is 500 ms.
+func WithLagInterval(d time.Duration) Option { return func(s *settings) { s.lagInterval = d } }
+
+// WithValkeyACL makes the service connect with an ACL user that has the key
+// pattern ~events:* and the two stream selectors of platform-go, as in
+// production. Server.ValkeyUser is the name of the user.
+func WithValkeyACL() Option { return func(s *settings) { s.valkeyACL = true } }
+
 // WithConfigure changes the config before the service starts.
 func WithConfigure(f func(*config.Config)) Option {
 	return func(s *settings) { s.configure = append(s.configure, f) }
@@ -46,11 +62,12 @@ func WithConfigure(f func(*config.Config)) Option {
 
 // Server is a running events service.
 type Server struct {
-	App       *services.App
-	Config    config.Config
-	DB        DB
-	PublicURL string
-	AdminURL  string
+	App        *services.App
+	Config     config.Config
+	DB         DB
+	ValkeyUser string
+	PublicURL  string
+	AdminURL   string
 
 	stopOnce sync.Once
 }
@@ -71,7 +88,7 @@ func (e *Env) Start(t testing.TB, opts ...Option) *Server {
 // StartE is Start with an error result. It is safe to call it from a goroutine
 // of a test. The caller stops the server.
 func (e *Env) StartE(t testing.TB, opts ...Option) (*Server, error) {
-	s := settings{maxBodyBytes: config.DefaultMaxBodyBytes, client: "events"}
+	s := settings{maxBodyBytes: config.DefaultMaxBodyBytes, client: "events", lagInterval: 500 * time.Millisecond}
 	for _, o := range opts {
 		o(&s)
 	}
@@ -93,6 +110,13 @@ func (e *Env) StartE(t testing.TB, opts ...Option) (*Server, error) {
 		Client:       e.ClientConfig(s.client),
 		MaxBodyBytes: s.maxBodyBytes,
 	}
+	cfg.Lag.Interval = s.lagInterval
+	valkeyUser := ""
+	if s.valkeyACL {
+		var pw string
+		valkeyUser, pw = e.NewValkeyACLUser(t)
+		cfg.Valkey.Username, cfg.Valkey.Password = valkeyUser, platformconfig.Secret(pw)
+	}
 	cfg.Admin.Addr = "127.0.0.1:0"
 	cfg.Admin.CheckTimeout = 2 * time.Second
 	cfg.Admin.DrainDelay = time.Millisecond
@@ -106,12 +130,16 @@ func (e *Env) StartE(t testing.TB, opts ...Option) (*Server, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	app, err := services.Start(context.Background(), cfg, services.WithLogger(logger))
+	opts2 := []services.Option{services.WithLogger(logger)}
+	if s.meter != nil {
+		opts2 = append(opts2, services.WithMeterProvider(s.meter))
+	}
+	app, err := services.Start(context.Background(), cfg, opts2...)
 	if err != nil {
 		return nil, err
 	}
 	srv := &Server{
-		App: app, Config: cfg, DB: db,
+		App: app, Config: cfg, DB: db, ValkeyUser: valkeyUser,
 		PublicURL: "http://" + app.PublicAddr(), AdminURL: "http://" + app.AdminAddr(),
 	}
 	return srv, nil
