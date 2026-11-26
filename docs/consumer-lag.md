@@ -43,9 +43,11 @@ The gauge callbacks read a snapshot. They do not call Valkey or PostgreSQL.
 
 After a failed operation, the snapshot keeps the last value of each group that the failure affects. It keeps the value for a maximum of 5 collections. Then it drops the value. A failed `lag` affects one group. A failed `groups` affects all groups of the stream. A failed `apps` affects all groups. The kept value is the last value, with no change. With the default interval, 5 collections are 2.5 minutes. After that time, no value is better than an old value, and the alert on `constellation.events.lag.collected` shows the problem.
 
-### The cap of 1000 groups
+### The caps on groups
 
-One collection reads a maximum of 1000 groups, in the order of stream and group. `constellation.events.lag.groups` shows the count that the service found before the cap. When the count is more than 1000, the worker writes the warn log `events.lag.groups_capped`. It writes the log only when the count of dropped groups changes. The worker does not check the name of a group. A group with an unusual name has a value.
+One collection reads a maximum of 100 groups for each stream and a maximum of 1000 groups in total, in the order of stream and group. `constellation.events.lag.groups` shows the count that the service found before the caps. When the collection does not read a group because of a cap, the worker writes the warn log `events.lag.groups_capped`. It writes the log only when the count of dropped groups changes. A collection in which a stream did not answer keeps the old count and the old log state.
+
+The collection skips a group whose name is longer than 256 bytes or is not valid UTF-8. A name that is not valid UTF-8 makes the export of all metrics fail. The worker writes the warn log `events.lag.groups_skipped` when the count of skipped groups changes.
 
 ## Alerts
 
@@ -58,7 +60,7 @@ Example queries:
 
 ```promql
 max by (stream, group) (constellation_events_consumer_lag_seconds) > 43200
-time() - max(constellation_events_lag_collected_seconds) > 300
+(time() - max(constellation_events_lag_collected_seconds) > 300) or absent(constellation_events_lag_collected_seconds)
 ```
 
 The Prometheus names depend on the exporter. The OpenTelemetry names are in the table above. A value of `constellation.events.lag.collected` that does not exist also means that no full collection happened.

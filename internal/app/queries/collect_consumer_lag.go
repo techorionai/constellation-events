@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"time"
+	"unicode/utf8"
 
 	"github.com/techorionai/constellation-events/internal/ports/registrations"
 	"github.com/techorionai/constellation-events/internal/ports/streams"
@@ -13,6 +14,14 @@ import (
 // less than the default limit of 2000 series for each instrument of the OTel
 // Go SDK.
 const MaxLagGroups = 1000
+
+// MaxLagGroupsPerStream is the largest count of groups that one collection
+// reads for one stream. The limit stops one stream from using the full cap.
+const MaxLagGroupsPerStream = 100
+
+// MaxGroupNameBytes is the longest group name that the collection reads. The
+// collection skips a longer name, and a name that is not valid UTF-8.
+const MaxGroupNameBytes = 256
 
 // Operations of a collection.
 const (
@@ -55,7 +64,13 @@ type CollectConsumerLagResult struct {
 	Values []LagValue
 	// GroupsFound is the count of groups before the cap.
 	GroupsFound int
-	Failures    []LagFailure
+	// GroupsSkipped is the count of groups that the collection did not read,
+	// because the name is too long or is not valid UTF-8.
+	GroupsSkipped int
+	// GroupsCapped is the count of valid groups that the collection did not
+	// read, because of MaxLagGroups or MaxLagGroupsPerStream.
+	GroupsCapped int
+	Failures     []LagFailure
 }
 
 // CollectConsumerLagHandler runs CollectConsumerLag.
@@ -91,10 +106,17 @@ func (h *CollectConsumerLagHandler) Execute(ctx context.Context, _ CollectConsum
 			continue
 		}
 		res.GroupsFound += len(groups)
+		valid := make([]string, 0, len(groups))
 		for _, group := range groups {
-			if read >= MaxLagGroups {
-				break
+			if len(group) > MaxGroupNameBytes || !utf8.ValidString(group) {
+				res.GroupsSkipped++
+				continue
 			}
+			valid = append(valid, group)
+		}
+		keep := min(len(valid), MaxLagGroupsPerStream, MaxLagGroups-read)
+		res.GroupsCapped += len(valid) - keep
+		for _, group := range valid[:keep] {
 			read++
 			if ctx.Err() != nil {
 				res.Failures = append(res.Failures, LagFailure{Operation: OperationLag, Stream: app, Group: group, Err: ctx.Err(), Skipped: true})

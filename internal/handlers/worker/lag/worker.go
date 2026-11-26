@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/techorionai/constellation-platform-go/executor"
 	"go.opentelemetry.io/otel/attribute"
@@ -67,10 +69,15 @@ type Worker struct {
 	log      *slog.Logger
 	now      func() time.Time
 
-	snap    atomic.Pointer[snapshot]
-	errors  metric.Int64Counter
-	reg     metric.Registration
+	snap   atomic.Pointer[snapshot]
+	errors metric.Int64Counter
+	reg    metric.Registration
+
+	// mu makes the collections run one after the other. It guards dropped
+	// and skipped.
+	mu      sync.Mutex
 	dropped int
+	skipped int
 }
 
 // New makes the worker and registers the instruments. It does not start the
@@ -157,8 +164,11 @@ func (w *Worker) runOnce(ctx context.Context) {
 	w.Collect(cctx)
 }
 
-// Collect runs one collection and stores the new snapshot.
+// Collect runs one collection and stores the new snapshot. A parallel call
+// waits for the call in progress.
 func (w *Worker) Collect(ctx context.Context) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	res, err := w.collect.Execute(ctx, queries.CollectConsumerLag{})
 	if err != nil {
 		// The query reports failures in its result. An error is a defect.
@@ -185,7 +195,9 @@ func (w *Worker) Collect(ctx context.Context) {
 		default:
 			failedGroups[groupKey{f.Stream, f.Group}] = true
 		}
-		if f.Skipped {
+		// A cancel of the parent context is a shutdown, not a failure. A time
+		// limit of the collection is a failure.
+		if f.Skipped || errors.Is(ctx.Err(), context.Canceled) {
 			continue
 		}
 		w.errors.Add(context.WithoutCancel(ctx), 1, metric.WithAttributes(attribute.String("operation", f.Operation)))
@@ -196,6 +208,12 @@ func (w *Worker) Collect(ctx context.Context) {
 	}
 
 	for _, v := range res.Values {
+		// An attribute with a value that is not valid UTF-8 makes the export
+		// of all metrics fail. The query skips such names. This is a second guard.
+		if !utf8.ValidString(v.Stream) || !utf8.ValidString(v.Group) {
+			res.GroupsSkipped++
+			continue
+		}
 		k := groupKey{v.Stream, v.Group}
 		next.values[k] = entry{lag: v.Lag.Seconds()}
 		next.order = append(next.order, k)
@@ -218,10 +236,13 @@ func (w *Worker) Collect(ctx context.Context) {
 	}
 	sortKeys(next.order)
 
-	if !appsFailed {
+	// A count from a collection that lost a stream is too low. Keep the old
+	// count and the old log state in that case.
+	if !appsFailed && len(failedStreams) == 0 {
 		next.groupsFound, next.groupsKnown = res.GroupsFound, true
 		w.logCap(ctx, res)
 	}
+	w.logSkipped(ctx, res.GroupsSkipped)
 	if len(res.Failures) == 0 {
 		next.collected, next.collectedSet = w.now().Unix(), true
 	}
@@ -230,11 +251,20 @@ func (w *Worker) Collect(ctx context.Context) {
 
 // logCap writes the warn log when the count of dropped groups changes.
 func (w *Worker) logCap(ctx context.Context, res queries.CollectConsumerLagResult) {
-	dropped := max(res.GroupsFound-queries.MaxLagGroups, 0)
+	dropped := res.GroupsCapped
 	if dropped != w.dropped && dropped > 0 {
 		w.log.LogAttrs(ctx, slog.LevelWarn, "events.lag.groups_capped",
 			slog.String("action", "events.lag.groups_capped"),
 			slog.Int("found", res.GroupsFound), slog.Int("dropped", dropped))
 	}
 	w.dropped = dropped
+}
+
+// logSkipped writes the warn log when the count of skipped groups changes.
+func (w *Worker) logSkipped(ctx context.Context, skipped int) {
+	if skipped != w.skipped && skipped > 0 {
+		w.log.LogAttrs(ctx, slog.LevelWarn, "events.lag.groups_skipped",
+			slog.String("action", "events.lag.groups_skipped"), slog.Int("skipped", skipped))
+	}
+	w.skipped = skipped
 }

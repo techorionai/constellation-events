@@ -298,8 +298,10 @@ func (a *App) release(ctx context.Context) {
 			a.publisherWG.Wait()
 		}
 		if a.stopLag != nil {
+			// The cancel ends the calls of the worker. Wait for the worker, so
+			// that the clients close after the last call.
 			a.stopLag()
-			waitTimeout(&a.lagWG, 5*time.Second)
+			a.lagWG.Wait()
 		}
 		if a.lag != nil {
 			_ = a.lag.Close()
@@ -346,10 +348,6 @@ func RunMigrations(ctx context.Context, db *clientpg.Client) error {
 // startLag registers the lag instruments and starts the lag worker in a
 // goroutine.
 func (a *App) startLag(ctx context.Context, repo *postgres.Registrations, o options) error {
-	interval := a.cfg.Lag.Interval
-	if interval <= 0 {
-		interval = config.DefaultLagInterval
-	}
 	mp := o.meter
 	if mp == nil {
 		mp = otel.GetMeterProvider()
@@ -358,7 +356,7 @@ func (a *App) startLag(ctx context.Context, repo *postgres.Registrations, o opti
 	observe := []decorators.Option{decorators.WithLogger(a.log)}
 	w, err := lag.New(lag.Config{
 		Collect:  decorators.ApplyTracing(decorators.ApplyLogging(collect, "CollectConsumerLag", observe...), "CollectConsumerLag"),
-		Interval: interval,
+		Interval: a.cfg.Lag.Interval,
 		Meter:    mp.Meter("events"),
 		Log:      a.log,
 	})
@@ -374,17 +372,4 @@ func (a *App) startLag(ctx context.Context, repo *postgres.Registrations, o opti
 		w.Run(lagCtx)
 	}()
 	return nil
-}
-
-// waitTimeout waits for the group, for at most d.
-func waitTimeout(wg *sync.WaitGroup, d time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(d):
-	}
 }

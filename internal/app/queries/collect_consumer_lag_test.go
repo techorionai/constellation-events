@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,7 +91,7 @@ func TestU2_NoGroupIsNotAFailure(t *testing.T) {
 
 // U3: 1001 groups on 2 streams give the first 1000 values and a count of 1001.
 func TestU3_Cap(t *testing.T) {
-	a, b := make([]string, 600), make([]string, 401)
+	a, b := make([]string, 600), make([]string, 50)
 	for i := range a {
 		a[i] = fmt.Sprintf("g%04d", i)
 	}
@@ -100,15 +101,49 @@ func TestU3_Cap(t *testing.T) {
 	f := fake{groups: map[string][]string{"alpha": a, "beta": b}}
 	s := f.streams()
 	res := run(t, f.apps(), s)
-	if len(res.Values) != 1000 || res.GroupsFound != 1001 {
-		t.Fatalf("values = %d, found = %d", len(res.Values), res.GroupsFound)
+	if len(res.Values) != 150 || res.GroupsFound != 650 || res.GroupsCapped != 500 {
+		t.Fatalf("values = %d, found = %d, capped = %d", len(res.Values), res.GroupsFound, res.GroupsCapped)
 	}
-	last := res.Values[999]
-	if last.Stream != "beta" || last.Group != "g0399" {
-		t.Fatalf("last value = %+v", last)
+	if res.Values[99].Stream != "alpha" || res.Values[100].Stream != "beta" {
+		t.Fatalf("the cap of one stream must not hide the next stream: %+v %+v", res.Values[99], res.Values[100])
 	}
-	if s.Calls() != 2+1000 {
-		t.Fatalf("calls = %d, want 1002", s.Calls())
+	if s.Calls() != 2+150 {
+		t.Fatalf("calls = %d, want 152", s.Calls())
+	}
+}
+
+// U3b: the total cap of 1000 groups holds for many streams.
+func TestU3b_TotalCap(t *testing.T) {
+	var apps []string
+	groups := make([]string, queries.MaxLagGroupsPerStream)
+	for i := range groups {
+		groups[i] = fmt.Sprintf("g%03d", i)
+	}
+	for i := range 12 {
+		apps = append(apps, fmt.Sprintf("app%02d", i))
+	}
+	reg := &mock.Registrations{ListAppsFunc: func(context.Context) ([]string, error) { return apps, nil }}
+	s := &mock.Streams{
+		GroupsFunc: func(context.Context, string) ([]string, error) { return groups, nil },
+		LagFunc:    func(context.Context, string, string) (time.Duration, error) { return time.Second, nil },
+	}
+	res := run(t, reg, s)
+	if len(res.Values) != queries.MaxLagGroups || res.GroupsFound != 1200 || res.GroupsCapped != 200 {
+		t.Fatalf("values = %d, found = %d, capped = %d", len(res.Values), res.GroupsFound, res.GroupsCapped)
+	}
+}
+
+// U14: a group name that is not valid UTF-8 or is too long gets no Lag call.
+func TestU14_SkipBadNames(t *testing.T) {
+	long := strings.Repeat("x", queries.MaxGroupNameBytes+1)
+	f := fake{groups: map[string][]string{"alpha": {"bad\xff", long, "good", strings.Repeat("y", queries.MaxGroupNameBytes)}}}
+	s := f.streams()
+	res := run(t, f.apps(), s)
+	if len(res.Values) != 2 || res.GroupsSkipped != 2 || res.GroupsFound != 4 || len(res.Failures) != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	if s.Calls() != 1+2 {
+		t.Fatalf("calls = %d, want 3", s.Calls())
 	}
 }
 

@@ -262,7 +262,7 @@ func TestU10_CapLog(t *testing.T) {
 	h := newHarness(t, time.Second)
 	ctx := context.Background()
 	step := func(found int) int64 {
-		h.set(queries.CollectConsumerLagResult{GroupsFound: found})
+		h.set(queries.CollectConsumerLagResult{GroupsFound: found, GroupsCapped: max(found-1000, 0)})
 		h.w.Collect(ctx)
 		return *h.read(t).groups
 	}
@@ -377,5 +377,80 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		if _, err := lag.New(cfg); err == nil {
 			t.Fatalf("%s: want an error", name)
 		}
+	}
+}
+
+// U15: a collection that lost a stream keeps the old count and the old cap log state.
+func TestU15_PartialGroupsFailureKeepsCount(t *testing.T) {
+	h := newHarness(t, time.Second)
+	ctx := context.Background()
+	h.set(queries.CollectConsumerLagResult{GroupsFound: 1200, GroupsCapped: 200, Values: values("alpha", "a1")})
+	h.w.Collect(ctx)
+	h.set(queries.CollectConsumerLagResult{
+		GroupsFound: 10, Values: values("alpha", "a1"),
+		Failures: []queries.LagFailure{fail(queries.OperationGroups, "beta", "")},
+	})
+	h.w.Collect(ctx)
+	if got := *h.read(t).groups; got != 1200 {
+		t.Fatalf("groups = %d, want 1200", got)
+	}
+	h.set(queries.CollectConsumerLagResult{GroupsFound: 1200, GroupsCapped: 200, Values: values("alpha", "a1")})
+	h.w.Collect(ctx)
+	if n := h.logs.count("events.lag.groups_capped"); n != 1 {
+		t.Fatalf("cap logs = %d, want 1", n)
+	}
+}
+
+// U16: a value with a name that is not valid UTF-8 is not in the instruments.
+func TestU16_InvalidUTF8Name(t *testing.T) {
+	h := newHarness(t, time.Second)
+	h.set(queries.CollectConsumerLagResult{Values: values("alpha", "good", "bad\xff")})
+	h.w.Collect(context.Background())
+	s := h.read(t)
+	if len(s.lags) != 1 || s.lags["alpha/good"] == 0 {
+		t.Fatalf("lags = %v", s.lags)
+	}
+	if n := h.logs.count("events.lag.groups_skipped"); n != 1 {
+		t.Fatalf("skip logs = %d, want 1", n)
+	}
+}
+
+// U17: a failure that comes from a cancel of the parent context is not counted or logged.
+func TestU17_ShutdownIsNotAFailure(t *testing.T) {
+	h := newHarness(t, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.set(queries.CollectConsumerLagResult{Failures: []queries.LagFailure{{Operation: queries.OperationLag, Stream: "alpha", Group: "a1", Err: context.Canceled}}})
+	h.w.Collect(ctx)
+	if n := h.logs.count("events.lag.collect_failed"); n != 0 {
+		t.Fatalf("failure logs = %d, want 0", n)
+	}
+	if e := h.read(t).errors; len(e) != 0 {
+		t.Fatalf("errors = %v", e)
+	}
+}
+
+// U18: parallel calls of Collect have no data race (run with -race in CI).
+func TestU18_ParallelCollect(t *testing.T) {
+	h := newHarness(t, time.Second)
+	h.set(queries.CollectConsumerLagResult{GroupsFound: 1100, GroupsCapped: 100, Values: values("alpha", "a1")})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() { defer wg.Done(); h.w.Collect(context.Background()) }()
+	}
+	wg.Wait()
+}
+
+// U19: the worker refuses an interval of 0.
+func TestU19_IntervalRequired(t *testing.T) {
+	mp := sdkmetric.NewMeterProvider()
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	collect := executor.FuncWithReturn[queries.CollectConsumerLag, queries.CollectConsumerLagResult](
+		func(context.Context, queries.CollectConsumerLag) (queries.CollectConsumerLagResult, error) {
+			return queries.CollectConsumerLagResult{}, nil
+		})
+	if _, err := lag.New(lag.Config{Collect: collect, Meter: mp.Meter("events")}); err == nil {
+		t.Fatal("want an error")
 	}
 }
