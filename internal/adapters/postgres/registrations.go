@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,15 +29,26 @@ var _ registrations.Repository = (*Registrations)(nil)
 // New makes the repository.
 func New(pool *pgxpool.Pool) *Registrations { return &Registrations{pool: pool} }
 
+// unavailableCode tells whether a PostgreSQL error code means that the store
+// cannot serve requests now. The classes are 08 (connection exception), 53
+// (insufficient resources), and 57P (operator intervention: shutdown, crash
+// shutdown, cannot connect now).
+func unavailableCode(code string) bool {
+	return strings.HasPrefix(code, "08") || strings.HasPrefix(code, "53") ||
+		code == "57P01" || code == "57P02" || code == "57P03"
+}
+
 // wrap maps an error of the driver. An error that has no PostgreSQL error code
 // (a closed connection, a refused connection, a timeout) is an unavailable
-// store. An error with a code is a failure of the service.
+// store. An error with a code of class 08, class 53, or 57P01 to 57P03 is also
+// an unavailable store. Each other error with a code is a failure of the
+// service.
 func wrap(op string, err error) error {
 	if err == nil {
 		return nil
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code != "57P01" && pgErr.Code != "57P02" && pgErr.Code != "57P03" {
+	if errors.As(err, &pgErr) && !unavailableCode(pgErr.Code) {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 	return fmt.Errorf("%s: %w: %w", op, registrations.ErrUnavailable, err)
@@ -98,6 +110,11 @@ func (r *Registrations) Register(ctx context.Context, reg domain.Registration, h
 	res := domain.Result{App: reg.App, Changed: true}
 	for _, t := range reg.EventTypes {
 		var inserted bool
+		// xmax is 0 in the row version that an INSERT makes. An update of an
+		// existing row (ON CONFLICT DO UPDATE) sets xmax to the ID of the
+		// updating transaction. The expression tells a new type from a changed
+		// type. It uses an internal detail of PostgreSQL, and the integration
+		// tests (I1 to I4) check it.
 		err := tx.QueryRow(ctx, `
 			INSERT INTO event_types (type, app, description, data_schema, deprecated, created_at, updated_at, removed_at)
 			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $6, NULL)

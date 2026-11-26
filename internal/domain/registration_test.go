@@ -254,3 +254,52 @@ func toPlatform(r domain.Registration) eventtypes.Registration {
 	}
 	return out
 }
+
+// R12: a local $ref cannot point into an unknown keyword. The target would
+// compile with no check of the $id and the depth.
+func TestR12_RefIntoUnknownKeyword(t *testing.T) {
+	deep := strings.Repeat(`{"properties":{"a":`, 100) + `{}` + strings.Repeat(`}}`, 100)
+	bad := map[string]string{
+		"id in unknown keyword":    `{"$ref":"#/x","x":{"$id":"urn:other"}}`,
+		"deep in unknown keyword":  `{"$ref":"#/x","x":` + deep + `}`,
+		"pointer into const":       `{"$ref":"#/const/a","const":{"a":{"$id":"urn:other"}}}`,
+		"escaped pointer":          `{"$ref":"#/%78","x":{"$id":"urn:other"}}`,
+		"anchor in unknown":        `{"$ref":"#a","x":{"$anchor":"a","$id":"urn:other"}}`,
+		"dynamic ref":              `{"$dynamicRef":"#/x","x":{"$id":"urn:other"}}`,
+		"nested ref to unexamined": `{"properties":{"p":{"$ref":"#/x"}},"x":{"$id":"urn:other"}}`,
+	}
+	for name, schema := range bad {
+		t.Run(name, func(t *testing.T) {
+			if err := domain.CheckDataSchema("helpdesk.ticket.created", json.RawMessage(schema)); err == nil {
+				t.Fatalf("the schema %s was accepted", schema)
+			}
+		})
+	}
+	good := map[string]string{
+		"root":        `{"properties":{"a":{"$ref":"#"}}}`,
+		"defs":        `{"$defs":{"a":{"type":"string"},"b/c":{"type":"integer"}},"properties":{"x":{"$ref":"#/$defs/a"},"y":{"$ref":"#/$defs/b~1c"}}}`,
+		"anchor":      `{"$defs":{"a":{"$anchor":"foo","type":"string"}},"properties":{"x":{"$ref":"#foo"}}}`,
+		"property id": `{"properties":{"$id":{"type":"string"}}}`,
+	}
+	for name, schema := range good {
+		t.Run("good "+name, func(t *testing.T) {
+			if err := domain.CheckDataSchema("helpdesk.ticket.created", json.RawMessage(schema)); err != nil {
+				t.Fatalf("the schema %s was refused: %v", schema, err)
+			}
+		})
+	}
+}
+
+// R13: a body with too many types gets the count error and no schema compile.
+func TestR13_TooManyTypesNoCompile(t *testing.T) {
+	// Each schema is not valid. If the function compiled them, it would add
+	// one invalid_data_schema error for each type.
+	types := make([]domain.EventTypeDefinition, 0, domain.MaxTypesPerRegistration+1)
+	for i := 0; i <= domain.MaxTypesPerRegistration; i++ {
+		types = append(types, def(fmt.Sprintf("helpdesk.a.t%d", i), "d", `{"type":5}`))
+	}
+	errs := reg("helpdesk", types...).Validate()
+	if len(errs) != 1 || !hasError(errs, "/eventTypes", domain.CodeLimitExceeded) {
+		t.Fatalf("errors = %v, want only the count error", codes(errs))
+	}
+}

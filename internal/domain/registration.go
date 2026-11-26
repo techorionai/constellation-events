@@ -83,6 +83,11 @@ func (r Registration) Validate() []FieldError {
 	}
 	if n := len(r.EventTypes); n < 1 || n > MaxTypesPerRegistration {
 		add("/eventTypes", CodeLimitExceeded, fmt.Sprintf("A registration has 1 to %d event types.", MaxTypesPerRegistration))
+		if n > MaxTypesPerRegistration {
+			// Do not check or compile the types of a body that is too large.
+			// Each compile costs CPU, and the body limit is the only other limit.
+			return errs
+		}
 	}
 	seen := make(map[string]struct{}, len(r.EventTypes))
 	for i, t := range r.EventTypes {

@@ -135,8 +135,9 @@ func (h *RegisterEventTypesHandler) audit(ctx context.Context, p auth.Principal,
 	h.log.InfoContext(ctx, "events.event_type.register", attrs...)
 }
 
-// LogDenied writes the audit record of a registration that gave 403.
-func LogDenied(ctx context.Context, log *slog.Logger, p auth.Principal, app string) {
-	log.InfoContext(ctx, "events.event_type.register", "action", AuditAction, "principal", p.ID,
-		"principal_type", string(p.Type), "app", app, "result", ResultDenied)
+// LogDenied writes the audit record of a registration that gave 403. It uses
+// the logger of the handler, so all audit records of a registration come from
+// one place.
+func (h *RegisterEventTypesHandler) LogDenied(ctx context.Context, p auth.Principal, app string) {
+	h.audit(ctx, p, app, ResultDenied, nil)
 }

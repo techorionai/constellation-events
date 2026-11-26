@@ -33,6 +33,7 @@ A `dataSchema` is untrusted data. The service compiles it as JSON Schema draft 2
 - `$schema`, if present, is `https://json-schema.org/draft/2020-12/schema`.
 - `$id` is not set.
 - Each `$ref` and `$dynamicRef` starts with `#`. A reference to a file, a URL, or a relative file gives 422.
+- A local reference points to a subschema that the service examines, or to its `$anchor`. A reference into an unknown keyword, `const`, `enum`, or `default` gives 422.
 - The nesting depth is a maximum of 32.
 - Each `pattern` is in the RE2 subset (Go `regexp`): no back reference and no look-around.
 - Format and content assertions stay off.

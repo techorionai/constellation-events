@@ -218,6 +218,7 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 		Verifier:     a.verify,
 		Scopes:       scopes,
 		Log:          log,
+		LogDenied:    register.LogDenied,
 	})
 	handler := otelhttp.NewHandler(requestid.Middleware()(api.Handler()), "events")
 	if a.pubL, err = (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.HTTP.Addr); err != nil {

@@ -3,6 +3,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -49,6 +50,9 @@ type Deps struct {
 	Verifier auth.Verifier
 	Scopes   ScopeTable
 	Log      *slog.Logger
+	// LogDenied writes the audit record of a registration that gave 403. A nil
+	// value writes no record.
+	LogDenied func(ctx context.Context, p auth.Principal, app string)
 }
 
 // New makes the server.
@@ -124,7 +128,9 @@ func (s *Server) logDenied(next http.Handler) http.Handler {
 		next.ServeHTTP(sw, r)
 		if sw.status == http.StatusForbidden {
 			p, _ := auth.PrincipalFromContext(r.Context())
-			commands.LogDenied(r.Context(), s.log, p, r.PathValue("app"))
+			if s.d.LogDenied != nil {
+				s.d.LogDenied(r.Context(), p, r.PathValue("app"))
+			}
 		}
 	})
 }
