@@ -32,7 +32,7 @@ The package `resources/test/testserver` starts one network with:
 
 - one PostgreSQL container with the database `identity`, and one new database for each events service,
 - one Valkey container,
-- the identity image `ghcr.io/techorionai/constellation-identity` with the tag `0.7.0`.
+- the identity image `ghcr.io/techorionai/constellation-identity` with the tag `0.7.1`.
 
 The identity container has the issuer `http://localhost:<port>` with a fixed host port. The test makes one P-256 key pair for each client at the start and writes the clients file. The rate limits of identity are off.
 
