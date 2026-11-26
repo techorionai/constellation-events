@@ -1,0 +1,32 @@
+{
+  "app": "events",
+  "permissions": [
+    {
+      "key": "events:event_type:register",
+      "description": "Register the event types of the own app."
+    },
+    {
+      "key": "events:catalog:read",
+      "description": "Read the event catalog."
+    }
+  ],
+  "defaultRoles": [
+    {
+      "key": "producer",
+      "name": "Producer",
+      "description": "Role of a service that publishes events. It can register its event types and read the catalog.",
+      "permissions": [
+        "events:event_type:register",
+        "events:catalog:read"
+      ]
+    },
+    {
+      "key": "reader",
+      "name": "Reader",
+      "description": "Role that can read the event catalog.",
+      "permissions": [
+        "events:catalog:read"
+      ]
+    }
+  ]
+}
