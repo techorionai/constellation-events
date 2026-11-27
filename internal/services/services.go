@@ -13,8 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/techorionai/constellation-platform-go/audit"
+	auditpg "github.com/techorionai/constellation-platform-go/audit/postgres"
 	"github.com/techorionai/constellation-platform-go/auth/clientcred"
 	"github.com/techorionai/constellation-platform-go/auth/jwt"
+	"github.com/techorionai/constellation-platform-go/clientinfo"
 	"github.com/techorionai/constellation-platform-go/clients/identity"
 	clientpg "github.com/techorionai/constellation-platform-go/clients/postgres"
 	clientvk "github.com/techorionai/constellation-platform-go/clients/valkey"
@@ -25,7 +28,14 @@ import (
 	"github.com/techorionai/constellation-platform-go/manifest"
 	"github.com/techorionai/constellation-platform-go/migrate"
 	migratepg "github.com/techorionai/constellation-platform-go/migrate/postgres"
+	"github.com/techorionai/constellation-platform-go/outbox"
+	outboxpg "github.com/techorionai/constellation-platform-go/outbox/postgres"
 	"github.com/techorionai/constellation-platform-go/requestid"
+	"github.com/techorionai/constellation-platform-go/retention"
+	retentionpg "github.com/techorionai/constellation-platform-go/retention/postgres"
+	"github.com/techorionai/constellation-platform-go/streams"
+	streamsvk "github.com/techorionai/constellation-platform-go/streams/valkey"
+	txpg "github.com/techorionai/constellation-platform-go/transaction/postgres"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
@@ -86,6 +96,9 @@ type App struct {
 
 	stopPublisher context.CancelFunc
 	publisherWG   sync.WaitGroup
+
+	stopAudit context.CancelFunc
+	auditWG   sync.WaitGroup
 
 	stopLag context.CancelFunc
 	lagWG   sync.WaitGroup
@@ -201,6 +214,14 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 		return nil, err
 	}
 
+	// 4b. Start the audit relay and the retention jobs of the audit outbox and
+	// the audit stream. They read the audit outbox table, thus they start
+	// after the migrations.
+	relay, err := a.startAudit(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+
 	// 5. Publish the own manifest in the background. A producer gets a token
 	// for the audience events only after this publish.
 	pubCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
@@ -214,9 +235,21 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 	}()
 
 	// 6. Make the use cases and start the public server.
-	register, err := commands.NewRegisterEventTypes(repo, log, o.clock)
+	writer, err := audit.New(auditpg.NewInserter(), audit.Config{App: "events", ClientID: cfg.Client.ID})
+	if err != nil {
+		return nil, fmt.Errorf("make the audit writer: %w", err)
+	}
+	register, err := commands.NewRegisterEventTypes(commands.Deps{
+		Repo: repo, Tx: txpg.NewTransactor(a.db.Pool), Writer: writer,
+		Limiter: commands.NewRefusedLimiter(cfg.Audit.RefusedLimitPerMinute, nil),
+		Notify:  relay.Notify, Log: log, Now: o.clock,
+	})
 	if err != nil {
 		return nil, err
+	}
+	proxies, err := cfg.HTTP.TrustedProxyPrefixes()
+	if err != nil {
+		return nil, fmt.Errorf("%sHTTP__TRUSTED_PROXIES: %w", config.Prefix, err)
 	}
 	if a.verify, err = jwt.New(cfg.Auth.JWT()); err != nil {
 		return nil, fmt.Errorf("make the token verifier: %w", err)
@@ -237,9 +270,10 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 		Verifier:     a.verify,
 		Scopes:       scopes,
 		Log:          log,
-		LogDenied:    register.LogDenied,
+		AuditDenied:  register.AuditDenied,
 	})
-	handler := otelhttp.NewHandler(requestid.Middleware()(api.Handler()), "events")
+	handler := otelhttp.NewHandler(
+		requestid.Middleware()(clientinfo.Middleware(clientinfo.Config{TrustedProxies: proxies})(api.Handler())), "events")
 	if a.pubL, err = (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.HTTP.Addr); err != nil {
 		return nil, fmt.Errorf("listen on the public address: %w", err)
 	}
@@ -297,6 +331,10 @@ func (a *App) release(ctx context.Context) {
 			a.stopPublisher()
 			a.publisherWG.Wait()
 		}
+		if a.stopAudit != nil {
+			a.stopAudit()
+			a.auditWG.Wait()
+		}
 		if a.stopLag != nil {
 			// The cancel ends the calls of the worker. Wait for the worker, so
 			// that the clients close after the last call.
@@ -335,6 +373,15 @@ func (a *App) release(ctx context.Context) {
 
 // RunMigrations runs the migrations of the service with the advisory lock.
 func RunMigrations(ctx context.Context, db *clientpg.Client) error {
+	auditMigrator, err := migratepg.NewMigrator(db.Pool, auditpg.Migrations(),
+		migratepg.MigratorOptions{MigrationsTable: auditpg.MigrationsTable})
+	if err != nil {
+		return fmt.Errorf("make the audit outbox migrator: %w", err)
+	}
+	if _, err := migrate.Run(ctx, migratepg.NewLocker(db.Pool, auditpg.MigrationsTable), auditMigrator,
+		migrate.Options{Name: auditpg.MigrationsTable}); err != nil {
+		return fmt.Errorf("run the audit outbox migrations: %w", err)
+	}
 	migrator, err := migratepg.NewMigrator(db.Pool, migrations.Files, migratepg.MigratorOptions{})
 	if err != nil {
 		return fmt.Errorf("make the migrator: %w", err)
@@ -372,4 +419,48 @@ func (a *App) startLag(ctx context.Context, repo *postgres.Registrations, o opti
 		w.Run(lagCtx)
 	}()
 	return nil
+}
+
+// startAudit starts the audit relay and the retention runner in goroutines.
+// It returns the relay, so that a commit can tell it about a new entry.
+func (a *App) startAudit(ctx context.Context, o options) (*outbox.Relay, error) {
+	store, err := outboxpg.NewStoreFor(a.db.Pool, auditpg.Table)
+	if err != nil {
+		return nil, fmt.Errorf("make the audit outbox store: %w", err)
+	}
+	pub := streamsvk.NewPublisher(a.kv.Raw, "events", streamsvk.WithFamily(streams.Audit), streamsvk.WithLogger(a.log))
+	relay, err := outbox.NewRelay(store, pub, outbox.RelayOptions{Name: "audit", Logger: a.log})
+	if err != nil {
+		return nil, fmt.Errorf("make the audit relay: %w", err)
+	}
+	tablePurger, err := retentionpg.NewTablePurger(a.db.Pool, retentionpg.TableSpec{Table: auditpg.Table, TimeColumn: "published_at"})
+	if err != nil {
+		return nil, fmt.Errorf("make the audit outbox purger: %w", err)
+	}
+	locker, err := retentionpg.NewLocker(a.db.Pool)
+	if err != nil {
+		return nil, fmt.Errorf("make the retention locker: %w", err)
+	}
+	runner, err := retention.NewRunner(locker, []retention.Job{
+		{Name: "audit_outbox", Config: a.cfg.Retention.AuditOutbox, DefaultPeriod: config.DefaultRetentionPeriod, Purger: tablePurger},
+		{
+			Name: "audit_stream", Config: a.cfg.Retention.AuditStream, DefaultPeriod: config.DefaultRetentionPeriod,
+			Purger: streamsvk.NewTrimPurger(a.kv.Raw, "events", streamsvk.WithFamily(streams.Audit)),
+		},
+	}, retention.RunnerOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("make the retention runner: %w", err)
+	}
+	auditCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	a.stopAudit = stop
+	a.auditWG.Add(2)
+	go func() {
+		defer a.auditWG.Done()
+		_ = relay.Run(auditCtx)
+	}()
+	go func() {
+		defer a.auditWG.Done()
+		_ = runner.Run(auditCtx)
+	}()
+	return relay, nil
 }

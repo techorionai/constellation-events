@@ -6,15 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/techorionai/constellation-platform-go/auth/clientcred"
 	"github.com/techorionai/constellation-platform-go/auth/jwt"
+	"github.com/techorionai/constellation-platform-go/clientinfo"
 	"github.com/techorionai/constellation-platform-go/clients/identity"
 	clientpg "github.com/techorionai/constellation-platform-go/clients/postgres"
 	clientvk "github.com/techorionai/constellation-platform-go/clients/valkey"
 	platformconfig "github.com/techorionai/constellation-platform-go/config"
 	"github.com/techorionai/constellation-platform-go/health"
+	"github.com/techorionai/constellation-platform-go/retention"
 )
 
 // Prefix is the prefix of all environment variables of the service.
@@ -47,6 +51,46 @@ type Lag struct {
 // HTTP is the config of the public listener.
 type HTTP struct {
 	Addr string `env:"ADDR" envDefault:":8080"`
+	// TrustedProxies is a comma list of CIDR prefixes of the own reverse
+	// proxies. The default is empty, so the service ignores X-Forwarded-For.
+	TrustedProxies string `env:"TRUSTED_PROXIES"`
+}
+
+// Retention is the config of the retention jobs of the audit outbox and the
+// audit stream. The default period of each job is 7 days.
+type Retention struct {
+	AuditOutbox retention.Config `envPrefix:"AUDIT_OUTBOX__"`
+	AuditStream retention.Config `envPrefix:"AUDIT_STREAM__"`
+}
+
+// Audit is the config of the audit entries.
+type Audit struct {
+	// RefusedLimitPerMinute is the maximum number of entries of refused
+	// registrations for each principal in one minute.
+	RefusedLimitPerMinute int `env:"REFUSED_LIMIT_PER_MINUTE" envDefault:"30"`
+}
+
+// Limits of the pool and of the refused limit.
+const (
+	// MinMaxConns is the smallest pool size. A retention tick uses 2
+	// connections, and the requests need at least 2 more.
+	MinMaxConns = 4
+	// MaxRefusedLimitPerMinute is the largest refused limit.
+	MaxRefusedLimitPerMinute = 10000
+	// DefaultRefusedLimitPerMinute is the default refused limit.
+	DefaultRefusedLimitPerMinute = 30
+)
+
+// DefaultRetentionPeriod is the default period of the retention jobs.
+const DefaultRetentionPeriod = 7 * 24 * time.Hour
+
+// TrustedProxyPrefixes parses TrustedProxies.
+func (h HTTP) TrustedProxyPrefixes() ([]netip.Prefix, error) {
+	cfg, err := clientinfo.ParseTrustedProxies(strings.TrimSpace(h.TrustedProxies))
+	if err != nil {
+		return nil, err
+	}
+	return cfg.TrustedProxies, nil
 }
 
 // Auth is the config of the token verifier. It has the fields of
@@ -86,6 +130,8 @@ type Config struct {
 	Client       clientcred.Config `envPrefix:"CLIENT__"`
 	Identity     identity.Config   `envPrefix:"IDENTITY__"`
 	Lag          Lag               `envPrefix:"LAG__"`
+	Retention    Retention         `envPrefix:"RETENTION__"`
+	Audit        Audit             `envPrefix:"AUDIT__"`
 	MaxBodyBytes int64             `env:"MAX_BODY_BYTES" envDefault:"4194304"`
 }
 
@@ -109,6 +155,21 @@ func (c Config) Validate() error {
 	}
 	if c.Lag.Interval < MinLagInterval || c.Lag.Interval > MaxLagInterval {
 		errs = append(errs, fmt.Errorf("%sLAG__INTERVAL: must be from %s to %s", Prefix, MinLagInterval, MaxLagInterval))
+	}
+	if _, err := c.HTTP.TrustedProxyPrefixes(); err != nil {
+		errs = append(errs, fmt.Errorf("%sHTTP__TRUSTED_PROXIES: %w", Prefix, err))
+	}
+	if c.Database.MaxConns != 0 && c.Database.MaxConns < MinMaxConns {
+		errs = append(errs, fmt.Errorf("%sDATABASE__MAX_CONNS: must be %d or more", Prefix, MinMaxConns))
+	}
+	if c.Audit.RefusedLimitPerMinute < 1 || c.Audit.RefusedLimitPerMinute > MaxRefusedLimitPerMinute {
+		errs = append(errs, fmt.Errorf("%sAUDIT__REFUSED_LIMIT_PER_MINUTE: must be from 1 to %d", Prefix, MaxRefusedLimitPerMinute))
+	}
+	if err := c.Retention.AuditOutbox.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("%sRETENTION__AUDIT_OUTBOX__*: %w", Prefix, err))
+	}
+	if err := c.Retention.AuditStream.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("%sRETENTION__AUDIT_STREAM__*: %w", Prefix, err))
 	}
 	return errors.Join(errs...)
 }

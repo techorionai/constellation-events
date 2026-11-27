@@ -7,12 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	clientpg "github.com/techorionai/constellation-platform-go/clients/postgres"
 
 	"github.com/techorionai/constellation-events/internal/domain"
 	"github.com/techorionai/constellation-events/internal/ports/registrations"
@@ -38,33 +42,52 @@ func unavailableCode(code string) bool {
 		code == "57P01" || code == "57P02" || code == "57P03"
 }
 
-// wrap maps an error of the driver. An error that has no PostgreSQL error code
-// (a closed connection, a refused connection, a timeout) is an unavailable
-// store. An error with a code of class 08, class 53, or 57P01 to 57P03 is also
-// an unavailable store. Each other error with a code is a failure of the
-// service.
+// unavailable tells whether err means that the store cannot serve requests. An
+// error with a PostgreSQL error code is unavailable only for a code of class
+// 08, class 53, or 57P01 to 57P03. An error with no code is unavailable only
+// for a failure of the connection: a closed or refused connection, an end of
+// the stream, or a timeout. A canceled context, a scan error, and each other
+// error are not unavailable.
+func unavailable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return unavailableCode(pgErr.Code)
+	}
+	var connErr *pgconn.ConnectError
+	var netErr net.Error
+	return errors.As(err, &connErr) || errors.As(err, &netErr) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) ||
+		pgconn.Timeout(err)
+}
+
+// wrap maps an error of the driver. An unavailable store gives
+// registrations.ErrUnavailable. Each other error is a failure of the service.
 func wrap(op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && !unavailableCode(pgErr.Code) {
+	if !unavailable(err) {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 	return fmt.Errorf("%s: %w: %w", op, registrations.ErrUnavailable, err)
 }
 
-// Register stores a registration in one transaction. The transaction inserts
-// the row of the app if it does not exist, then locks it. A second
-// registration of the same app waits for the lock and sees the result of the
-// first one.
+// Unavailable tells whether err means that the store cannot serve requests.
+// See unavailable for the errors that count.
+func (r *Registrations) Unavailable(err error) bool { return unavailable(err) }
+
+// Register stores a registration. It joins the transaction in the context. The
+// caller starts the transaction and commits it. The statements insert the row
+// of the app if it does not exist, then lock it. A second registration of the
+// same app waits for the lock and sees the result of the first one. The result
+// has the names of the added, removed, and modified types.
 func (r *Registrations) Register(ctx context.Context, reg domain.Registration, hash []byte, registeredBy string, now time.Time) (domain.Result, error) {
 	now = now.UTC().Truncate(time.Microsecond)
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return domain.Result{}, wrap("begin", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	tx := clientpg.Conn(ctx, r.pool)
 
 	// A row with version 0 is a placeholder. It is visible only in this
 	// transaction, because the transaction either replaces it or rolls back.
@@ -87,9 +110,6 @@ func (r *Registrations) Register(ctx context.Context, reg domain.Registration, h
 		count, err := countTypes(ctx, tx, reg.App)
 		if err != nil {
 			return domain.Result{}, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return domain.Result{}, wrap("commit", err)
 		}
 		return domain.Result{App: reg.App, Version: version, RegisteredAt: registeredAt.UTC(), EventTypeCount: count}, nil
 	}
@@ -135,17 +155,35 @@ func (r *Registrations) Register(ctx context.Context, reg domain.Registration, h
 			return domain.Result{}, wrap("upsert type", err)
 		case inserted:
 			res.Added++
+			res.AddedTypes = append(res.AddedTypes, t.Type)
 		default:
 			res.Modified++
+			res.ModifiedTypes = append(res.ModifiedTypes, t.Type)
 		}
 	}
-	tag, err := tx.Exec(ctx, `
+	rows, err := tx.Query(ctx, `
 		UPDATE event_types SET removed_at = $3, updated_at = $3
-		WHERE app = $1 AND removed_at IS NULL AND NOT (type = ANY($2))`, reg.App, names, now)
+		WHERE app = $1 AND removed_at IS NULL AND NOT (type = ANY($2))
+		RETURNING type`, reg.App, names, now)
 	if err != nil {
 		return domain.Result{}, wrap("remove types", err)
 	}
-	res.Removed = int(tag.RowsAffected())
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return domain.Result{}, wrap("scan removed type", err)
+		}
+		res.RemovedTypes = append(res.RemovedTypes, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return domain.Result{}, wrap("remove types", err)
+	}
+	res.Removed = len(res.RemovedTypes)
+	sort.Strings(res.AddedTypes)
+	sort.Strings(res.RemovedTypes)
+	sort.Strings(res.ModifiedTypes)
 
 	res.Version = version + 1
 	res.RegisteredAt = now
@@ -158,13 +196,10 @@ func (r *Registrations) Register(ctx context.Context, reg domain.Registration, h
 	if res.EventTypeCount, err = countTypes(ctx, tx, reg.App); err != nil {
 		return domain.Result{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return domain.Result{}, wrap("commit", err)
-	}
 	return res, nil
 }
 
-func countTypes(ctx context.Context, tx pgx.Tx, app string) (int, error) {
+func countTypes(ctx context.Context, tx clientpg.Querier, app string) (int, error) {
 	var n int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM event_types WHERE app = $1 AND removed_at IS NULL`, app).Scan(&n); err != nil {
 		return 0, wrap("count types", err)

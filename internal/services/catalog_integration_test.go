@@ -10,10 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/techorionai/constellation-platform-go/eventtypes"
 
 	"github.com/techorionai/constellation-events/resources/test/testserver"
 )
@@ -129,82 +127,7 @@ func TestI12_ParallelStart(t *testing.T) {
 	}
 }
 
-// I14: no log record has a JSON Schema, a description, a compiler text, a
-// token, or a private key. A change or a refused registration writes one
-// record with the action. An unchanged registration writes none.
-func TestI14_Logs(t *testing.T) {
-	logger, capture := testserver.NewLogCapture()
-	srv := started(t, testserver.WithLogger(logger))
-	const schemaMarker, descMarker = "SCHEMA_MARKER_7731", "DESCRIPTION_MARKER_5519"
-	a := typ{name: "helpdesk.ticket.created", description: descMarker, schema: `{"type":"object","title":"` + schemaMarker + `"}`}
-	b := newType("helpdesk.ticket.closed")
-	count := func() int { return len(capture.Records("events:event_type:register")) }
-
-	// I2: the first registration, with the publisher of platform-go.
-	reg, err := eventtypes.Load(fsOf("event-types.json", string(registration("helpdesk", a, b))), "event-types.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	client := eventsClient(t, srv, "helpdesk-svc")
-	if _, err := client.Register(ctx, reg); err != nil {
-		t.Fatal(err)
-	}
-	if count() != 1 {
-		t.Fatalf("after the first registration: %d records, want 1", count())
-	}
-	// I3: the same registration writes no record.
-	if _, err := client.Register(ctx, reg); err != nil {
-		t.Fatal(err)
-	}
-	if count() != 1 {
-		t.Fatalf("after the same registration: %d records, want 1", count())
-	}
-	// I4: a change writes one record.
-	registerOK(t, srv, "helpdesk-svc", "helpdesk", a)
-	if count() != 2 {
-		t.Fatalf("after a change: %d records, want 2", count())
-	}
-	// I5: a registration for another app writes one record.
-	token := env.Token(t, "helpdesk-svc", "events", registerScope)
-	if resp := srv.Do(t, http.MethodPut, registerPath("crm"), token, registration("crm", newType("crm.ticket.created"))); resp.Status != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d", resp.Status)
-	}
-	if count() != 3 {
-		t.Fatalf("after the app mismatch: %d records, want 3", count())
-	}
-	// I18: a reference to a file writes one record.
-	bad := typ{name: "helpdesk.ticket.bad", description: descMarker, schema: `{"$ref":"file:///etc/passwd"}`}
-	if resp := register(t, srv, "helpdesk-svc", "helpdesk", a, bad); resp.Status != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d", resp.Status)
-	}
-	if count() != 4 {
-		t.Fatalf("after the bad schema: %d records, want 4", count())
-	}
-	// A 403 writes one record with the result denied.
-	readerToken := env.Token(t, "reader-svc", "events", readScope)
-	if resp := srv.Do(t, http.MethodPut, registerPath("reader"), readerToken, registration("reader", newType("reader.ticket.created"))); resp.Status != http.StatusForbidden {
-		t.Fatalf("status = %d", resp.Status)
-	}
-	if count() != 5 {
-		t.Fatalf("after the 403: %d records, want 5", count())
-	}
-
-	text := capture.Text()
-	for _, forbidden := range []string{schemaMarker, descMarker, "etc/passwd", "a reference to", "PRIVATE KEY", token, readerToken, env.Clients["helpdesk-svc"].PEM[40:80]} {
-		if forbidden != "" && strings.Contains(text, forbidden) {
-			t.Fatalf("the log has %q", forbidden)
-		}
-	}
-	results := map[string]int{}
-	for _, r := range capture.Records("events:event_type:register") {
-		results[fmt.Sprint(r["result"])]++
-	}
-	if results["changed"] != 2 || results["invalid"] != 2 || results["denied"] != 1 {
-		t.Fatalf("results = %v", results)
-	}
-}
+// The log checks of the audit entries are in audit_integration_test.go (I6).
 
 // I15: a body of 5 MiB gives 413 and changes no row.
 func TestI15_BodyTooLarge(t *testing.T) {
