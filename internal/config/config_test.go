@@ -98,3 +98,38 @@ func TestU13_LagInterval(t *testing.T) {
 		})
 	}
 }
+
+// U4: bad values of the audit settings give errors that name the variable.
+func TestU4_AuditConfig(t *testing.T) {
+	cases := []struct{ name, key, value, want string }{
+		{"trusted proxies", "EVENTS_HTTP__TRUSTED_PROXIES", "bad", "TRUSTED_PROXIES"},
+		{"max conns", "EVENTS_DATABASE__MAX_CONNS", "2", "MAX_CONNS"},
+		{"refused limit zero", "EVENTS_AUDIT__REFUSED_LIMIT_PER_MINUTE", "0", "REFUSED_LIMIT_PER_MINUTE"},
+		{"refused limit large", "EVENTS_AUDIT__REFUSED_LIMIT_PER_MINUTE", "10001", "REFUSED_LIMIT_PER_MINUTE"},
+		{"outbox interval", "EVENTS_RETENTION__AUDIT_OUTBOX__INTERVAL", "10s", "AUDIT_OUTBOX"},
+		{"stream batch", "EVENTS_RETENTION__AUDIT_STREAM__BATCH_SIZE", "0", "AUDIT_STREAM"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv(tc.key, tc.value)
+			_, err := config.Load()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want the text %q", err, tc.want)
+			}
+		})
+	}
+	setRequired(t)
+	t.Setenv("EVENTS_HTTP__TRUSTED_PROXIES", "10.0.0.0/8,192.168.1.5/32")
+	t.Setenv("EVENTS_DATABASE__MAX_CONNS", "4")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Audit.RefusedLimitPerMinute != 30 {
+		t.Fatalf("default limit = %d, want 30", cfg.Audit.RefusedLimitPerMinute)
+	}
+	if p, err := cfg.HTTP.TrustedProxyPrefixes(); err != nil || len(p) != 2 {
+		t.Fatalf("proxies = %v, %v", p, err)
+	}
+}
