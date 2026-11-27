@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +14,7 @@ import (
 	clientpg "github.com/techorionai/constellation-platform-go/clients/postgres"
 	clientvk "github.com/techorionai/constellation-platform-go/clients/valkey"
 	platformconfig "github.com/techorionai/constellation-platform-go/config"
+	"github.com/techorionai/constellation-platform-go/retention"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/techorionai/constellation-events/internal/config"
@@ -51,8 +51,8 @@ func WithMeterProvider(mp metric.MeterProvider) Option { return func(s *settings
 func WithLagInterval(d time.Duration) Option { return func(s *settings) { s.lagInterval = d } }
 
 // WithValkeyACL makes the service connect with an ACL user that has the key
-// pattern ~events:* and the two stream selectors of platform-go, as in
-// production. Server.ValkeyUser is the name of the user.
+// pattern ~events:*, the two stream selectors, and the two audit producer
+// selectors of platform-go, as in production. Server.ValkeyUser is the name of the user.
 func WithValkeyACL() Option { return func(s *settings) { s.valkeyACL = true } }
 
 // WithConfigure changes the config before the service starts.
@@ -110,6 +110,9 @@ func (e *Env) StartE(t testing.TB, opts ...Option) (*Server, error) {
 		Client:       e.ClientConfig(s.client),
 		MaxBodyBytes: s.maxBodyBytes,
 	}
+	cfg.Audit.RefusedLimitPerMinute = config.DefaultRefusedLimitPerMinute
+	cfg.Retention.AuditOutbox = retention.Config{Interval: time.Hour, BatchSize: retention.DefaultBatchSize}
+	cfg.Retention.AuditStream = cfg.Retention.AuditOutbox
 	cfg.Lag.Interval = s.lagInterval
 	valkeyUser := ""
 	if s.valkeyACL {
@@ -253,19 +256,4 @@ func (c *LogCapture) Text() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.buf.String()
-}
-
-// Records returns the records that have the given action.
-func (c *LogCapture) Records(action string) []map[string]any {
-	var out []map[string]any
-	for _, line := range strings.Split(c.Text(), "\n") {
-		if line == "" {
-			continue
-		}
-		var m map[string]any
-		if json.Unmarshal([]byte(line), &m) == nil && m["action"] == action {
-			out = append(out, m)
-		}
-	}
-	return out
 }
