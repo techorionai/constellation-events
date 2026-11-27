@@ -14,6 +14,7 @@ import (
 	"github.com/techorionai/constellation-events/internal/app/commands"
 	httpapi "github.com/techorionai/constellation-events/internal/handlers/http"
 	"github.com/techorionai/constellation-events/internal/ports/registrations"
+	"github.com/techorionai/constellation-events/resources/test/mock"
 )
 
 // fakeVerifier gives the principal of the bearer token value.
@@ -32,13 +33,20 @@ type panicRepo struct{ registrations.Repository }
 
 const registerScope = "events:event_type:register"
 
+func newRegister() (*commands.RegisterEventTypesHandler, error) {
+	return commands.NewRegisterEventTypes(commands.Deps{
+		Repo: panicRepo{}, Tx: &mock.Transactor{}, Writer: &mock.AuditWriter{},
+		Limiter: commands.NewRefusedLimiter(30, nil),
+	})
+}
+
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
 	scopes, err := httpapi.NewScopeTable(openapi.Spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	register, err := commands.NewRegisterEventTypes(panicRepo{}, nil, nil)
+	register, err := newRegister()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +283,7 @@ func TestU10_DecodeRegisterBody(t *testing.T) {
 // The body limit gives 413 after the scope check.
 func TestBodyLimit(t *testing.T) {
 	scopes := mustTable(t)
-	register, err := commands.NewRegisterEventTypes(panicRepo{}, nil, nil)
+	register, err := newRegister()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,5 +301,48 @@ func TestBodyLimit(t *testing.T) {
 	}
 	if rec := do(h, http.MethodPut, "/v1/event-type-registrations/helpdesk", "noscope", big); rec.Code != http.StatusForbidden {
 		t.Fatalf("403 before 413: status = %d", rec.Code)
+	}
+}
+
+// U8: the denied step writes the entry before RequireScopes sends the 403, also
+// when the client has canceled the request. A principal with the scope writes
+// no denied entry.
+func TestU8_DeniedStep(t *testing.T) {
+	writer := &mock.AuditWriter{}
+	register, err := commands.NewRegisterEventTypes(commands.Deps{
+		Repo: panicRepo{}, Tx: &mock.Transactor{}, Writer: writer, Limiter: commands.NewRefusedLimiter(30, nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := httpapi.New(httpapi.Deps{
+		Register: register, MaxBodyBytes: 4 << 20, Scopes: mustTable(t), AuditDenied: register.AuditDenied,
+		Verifier: fakeVerifier{
+			"reader-svc": {ID: "reader-svc", Type: auth.PrincipalService, App: "reader", Scopes: []string{"events:catalog:read"}},
+			"service":    {ID: "helpdesk-svc", Type: auth.PrincipalService, App: "helpdesk", Scopes: []string{registerScope}},
+		},
+	}).Handler()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPut, "/v1/event-type-registrations/reader", strings.NewReader(body("reader")))
+	req.Header.Set("Authorization", "Bearer reader-svc")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	entries := writer.Entries()
+	if len(entries) != 1 || entries[0].Result != "denied" || entries[0].Target == nil || entries[0].Target.ID != "reader" {
+		t.Fatalf("entries = %+v", entries)
+	}
+
+	// A principal with the scope writes no denied entry. The store has no data,
+	// so the handler stops with a panic of panicRepo. A bad body stops earlier.
+	if rec := do(h, http.MethodPut, "/v1/event-type-registrations/helpdesk", "service", "not json"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if n := len(writer.Entries()); n != 1 {
+		t.Fatalf("entries = %d, want 1", n)
 	}
 }

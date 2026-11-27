@@ -50,9 +50,10 @@ type Deps struct {
 	Verifier auth.Verifier
 	Scopes   ScopeTable
 	Log      *slog.Logger
-	// LogDenied writes the audit record of a registration that gave 403. A nil
-	// value writes no record.
-	LogDenied func(ctx context.Context, p auth.Principal, app string)
+	// AuditDenied writes the audit entry of a registration that the scope check
+	// denies. The server calls it before RequireScopes sends the 403. A nil
+	// value writes no entry.
+	AuditDenied func(ctx context.Context, p auth.Principal, app string)
 }
 
 // New makes the server.
@@ -100,38 +101,22 @@ func (s *Server) protect(next http.Handler) http.Handler {
 		}
 		inner := auth.RequireScopes(scopes...)(next)
 		if r.Pattern == registerPattern {
-			inner = s.logDenied(auth.RequireScopes(scopes...)(s.decodeRegisterBody(next)))
+			inner = s.auditDenied(scopes, auth.RequireScopes(scopes...)(s.decodeRegisterBody(next)))
 		}
 		s.authMW(inner).ServeHTTP(w, r)
 	})
 }
 
-// statusWriter records the status of a response.
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
-}
-
-// Unwrap lets http.ResponseController reach the real writer.
-func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-
-// logDenied writes the audit record of a registration that gave 403. It runs
-// after the token check, so the request has the principal.
-func (s *Server) logDenied(next http.Handler) http.Handler {
+// auditDenied writes the audit entry of a registration of a principal that
+// has not all scopes. It runs after the token check and before RequireScopes,
+// so the entry does not depend on the response status or on the connection of
+// the client. RequireScopes then sends the 403.
+func (s *Server) auditDenied(scopes []string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sw := &statusWriter{ResponseWriter: w}
-		next.ServeHTTP(sw, r)
-		if sw.status == http.StatusForbidden {
-			p, _ := auth.PrincipalFromContext(r.Context())
-			if s.d.LogDenied != nil {
-				s.d.LogDenied(r.Context(), p, r.PathValue("app"))
-			}
+		if p, ok := auth.PrincipalFromContext(r.Context()); ok && s.d.AuditDenied != nil && len(p.MissingScopes(scopes...)) > 0 {
+			s.d.AuditDenied(r.Context(), p, r.PathValue("app"))
 		}
+		next.ServeHTTP(w, r)
 	})
 }
 

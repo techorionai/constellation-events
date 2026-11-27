@@ -179,6 +179,9 @@ type Result struct {
 	Changed bool
 	// Added, Removed, and Modified count the types that the registration changed.
 	Added, Removed, Modified int
+	// AddedTypes, RemovedTypes, and ModifiedTypes have the names of the types
+	// that the registration changed, in the order of the type.
+	AddedTypes, RemovedTypes, ModifiedTypes []string
 }
 
 // ApproxSize returns the size in bytes that the type has in a response body.

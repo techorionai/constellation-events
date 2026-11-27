@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/techorionai/constellation-platform-go/audit"
+	"github.com/techorionai/constellation-platform-go/transaction"
+
 	"github.com/techorionai/constellation-events/internal/domain"
 	"github.com/techorionai/constellation-events/internal/ports/registrations"
 	"github.com/techorionai/constellation-events/internal/ports/streams"
@@ -45,6 +48,9 @@ func (m *Registrations) ListApps(ctx context.Context) ([]string, error) {
 func (m *Registrations) Register(context.Context, domain.Registration, []byte, string, time.Time) (domain.Result, error) {
 	return domain.Result{}, nil
 }
+
+// Unavailable is not used.
+func (m *Registrations) Unavailable(error) bool { return false }
 
 // ListRegistrations is not used.
 func (m *Registrations) ListRegistrations(context.Context, string, int) ([]domain.StoredRegistration, error) {
@@ -98,4 +104,72 @@ func (m *Streams) Groups(ctx context.Context, app string) ([]string, error) {
 func (m *Streams) Lag(ctx context.Context, app, group string) (time.Duration, error) {
 	m.count()
 	return m.LagFunc(ctx, app, group)
+}
+
+// Transactor is a mock of the transaction port. It runs the function with the
+// same context and has no database. It runs the hooks after a function that
+// returns nil.
+type Transactor struct {
+	// Calls counts the calls of WithinTx.
+	Calls int
+
+	mu    sync.Mutex
+	hooks []func(context.Context)
+}
+
+var _ transaction.Transactor = (*Transactor)(nil)
+
+// WithinTx runs fn. It runs the hooks that fn registered when fn returns nil.
+func (m *Transactor) WithinTx(ctx context.Context, fn func(ctx context.Context) error, _ ...transaction.Option) error {
+	m.mu.Lock()
+	m.Calls++
+	m.hooks = nil
+	m.mu.Unlock()
+	if err := fn(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	hooks := m.hooks
+	m.hooks = nil
+	m.mu.Unlock()
+	for _, h := range hooks {
+		h(ctx)
+	}
+	return nil
+}
+
+// AfterCommit keeps fn until the end of the transaction.
+func (m *Transactor) AfterCommit(_ context.Context, fn func(ctx context.Context)) {
+	m.mu.Lock()
+	m.hooks = append(m.hooks, fn)
+	m.mu.Unlock()
+}
+
+// AuditWriter is a mock of the audit writer. It keeps the entries.
+type AuditWriter struct {
+	// Err is the error of each Write. A nil value means no error.
+	Err error
+
+	mu      sync.Mutex
+	entries []audit.Entry
+}
+
+var _ audit.Writer = (*AuditWriter)(nil)
+
+// Write keeps the entries, or returns Err.
+func (m *AuditWriter) Write(_ context.Context, entries ...audit.Entry) error {
+	if m.Err != nil {
+		return m.Err
+	}
+	m.mu.Lock()
+	m.entries = append(m.entries, entries...)
+	m.mu.Unlock()
+	return nil
+}
+
+// Entries returns the entries that the writer kept.
+func (m *AuditWriter) Entries() []audit.Entry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]audit.Entry(nil), m.entries...)
 }

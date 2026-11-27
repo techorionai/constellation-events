@@ -32,9 +32,13 @@ type TypeFilter struct {
 
 // Repository stores the registrations and the event types.
 type Repository interface {
-	// Register stores a registration. It runs in one transaction under a row
-	// lock of the app. An equal hash gives the stored result and no write.
+	// Register stores a registration. It joins the transaction in the context
+	// and runs under a row lock of the app. An equal hash gives the stored
+	// result and no write. The result has the names of the changed types.
 	Register(ctx context.Context, r domain.Registration, hash []byte, registeredBy string, now time.Time) (domain.Result, error)
+	// Unavailable tells whether err means that the store cannot serve requests
+	// now. It covers the errors of the transaction begin and commit.
+	Unavailable(err error) bool
 	// ListRegistrations returns at most limit registrations after the app
 	// "after", in the order of the app. Each has the types with no removal time.
 	ListRegistrations(ctx context.Context, after string, limit int) ([]domain.StoredRegistration, error)
