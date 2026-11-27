@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -40,36 +42,43 @@ func unavailableCode(code string) bool {
 		code == "57P01" || code == "57P02" || code == "57P03"
 }
 
-// wrap maps an error of the driver. An error that has no PostgreSQL error code
-// (a closed connection, a refused connection, a timeout) is an unavailable
-// store. An error with a code of class 08, class 53, or 57P01 to 57P03 is also
-// an unavailable store. Each other error with a code is a failure of the
-// service.
-func wrap(op string, err error) error {
-	if err == nil {
-		return nil
-	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && !unavailableCode(pgErr.Code) {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	return fmt.Errorf("%s: %w: %w", op, registrations.ErrUnavailable, err)
-}
-
-// Unavailable tells whether err means that the store cannot serve requests. An
-// error with no PostgreSQL error code (a closed connection, a refused
-// connection, a timeout) or with a code of class 08, class 53, or 57P01 to
-// 57P03 means an unavailable store.
-func (r *Registrations) Unavailable(err error) bool {
-	if err == nil {
+// unavailable tells whether err means that the store cannot serve requests. An
+// error with a PostgreSQL error code is unavailable only for a code of class
+// 08, class 53, or 57P01 to 57P03. An error with no code is unavailable only
+// for a failure of the connection: a closed or refused connection, an end of
+// the stream, or a timeout. A canceled context, a scan error, and each other
+// error are not unavailable.
+func unavailable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		return unavailableCode(pgErr.Code)
 	}
-	return true
+	var connErr *pgconn.ConnectError
+	var netErr net.Error
+	return errors.As(err, &connErr) || errors.As(err, &netErr) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) ||
+		pgconn.Timeout(err)
 }
+
+// wrap maps an error of the driver. An unavailable store gives
+// registrations.ErrUnavailable. Each other error is a failure of the service.
+func wrap(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if !unavailable(err) {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return fmt.Errorf("%s: %w: %w", op, registrations.ErrUnavailable, err)
+}
+
+// Unavailable tells whether err means that the store cannot serve requests.
+// See unavailable for the errors that count.
+func (r *Registrations) Unavailable(err error) bool { return unavailable(err) }
 
 // Register stores a registration. It joins the transaction in the context. The
 // caller starts the transaction and commits it. The statements insert the row

@@ -1,7 +1,10 @@
 package postgres
 
 import (
+	"context"
 	"errors"
+	"io"
+	"net"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -24,7 +27,20 @@ func TestWrapUnavailableCodes(t *testing.T) {
 			t.Errorf("code %s: unavailable = %v, want %v", code, got, unavailable)
 		}
 	}
-	if err := wrap("op", errors.New("closed")); !errors.Is(err, registrations.ErrUnavailable) {
-		t.Error("an error with no code must be unavailable")
+	for name, err := range map[string]error{
+		"closed network": net.ErrClosed, "end of stream": io.ErrUnexpectedEOF,
+		"timeout": context.DeadlineExceeded, "connect": &pgconn.ConnectError{},
+	} {
+		if !errors.Is(wrap("op", err), registrations.ErrUnavailable) || !(&Registrations{}).Unavailable(err) {
+			t.Errorf("%s must be unavailable", name)
+		}
+	}
+	// R1: an error that is not a failure of the connection is not unavailable.
+	for name, err := range map[string]error{
+		"canceled": context.Canceled, "scan": errors.New("scan: wrong type"),
+	} {
+		if errors.Is(wrap("op", err), registrations.ErrUnavailable) || (&Registrations{}).Unavailable(err) {
+			t.Errorf("%s must not be unavailable", name)
+		}
 	}
 }

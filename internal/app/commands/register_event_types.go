@@ -291,14 +291,21 @@ func refusedEntry(result audit.Result, pathApp, code string, at time.Time) audit
 
 // refuse writes the audit entry of a refused or denied request in a short
 // transaction of its own. The write does not depend on the cancel of the
-// request. A request over the limit of its principal writes no entry. A failed
+// request. A request over the limit of its principal writes no entry, but the first
+// one in a window gives a warn log record with the principal ID. A failed
 // write gives an error log record, and the response of the request does not
 // change.
 func (h *RegisterEventTypesHandler) refuse(ctx context.Context, p auth.Principal, result audit.Result, pathApp, code string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), RefusedWriteTimeout)
 	defer cancel()
-	if !h.limiter.Allow(p.ID) {
+	if allowed, first := h.limiter.Admit(p.ID); !allowed {
 		h.dropped.Add(ctx, 1)
+		if first {
+			// One record for each principal in each window keeps a trace of
+			// the principal and does not flood the log.
+			h.log.WarnContext(ctx, "the audit entries of refused registrations are over the limit and are dropped",
+				"principal_id", p.ID, "action", AuditAction, "result", string(result))
+		}
 		return
 	}
 	entry := refusedEntry(result, pathApp, code, h.now())

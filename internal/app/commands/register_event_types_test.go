@@ -387,6 +387,17 @@ func TestU7_RefusedLimiter(t *testing.T) {
 	if n := len(f.writer.Entries()); n != 2 {
 		t.Fatalf("entries = %d, want 2", n)
 	}
+	// R3: one warn record names the principal for the window.
+	logs := f.logs.String()
+	if n := strings.Count(logs, `"level":"WARN"`); n != 1 || !strings.Contains(logs, `"principal_id":"helpdesk-svc"`) {
+		t.Fatalf("want one warn record with the principal, logs = %s", logs)
+	}
+	for range 3 {
+		_, _ = f.h.Execute(context.Background(), c)
+	}
+	if n := strings.Count(f.logs.String(), `"level":"WARN"`); n != 1 {
+		t.Fatalf("warn records = %d, want 1 for each window", n)
+	}
 }
 
 // The limiter keeps at most MaxRefusedPrincipals windows, and it removes the

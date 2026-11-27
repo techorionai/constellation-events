@@ -31,7 +31,9 @@ type refusedWindow struct {
 	key   string
 	start time.Time
 	count int
-	elem  *list.Element
+	// dropLogged is true after the first refused request of the window.
+	dropLogged bool
+	elem       *list.Element
 }
 
 // NewRefusedLimiter makes a limiter. limit is the number of entries for each
@@ -46,6 +48,13 @@ func NewRefusedLimiter(limit int, now func() time.Time) *RefusedLimiter {
 // Allow tells whether the principal can write one more entry in the window,
 // and counts the entry when it can.
 func (l *RefusedLimiter) Allow(principalID string) bool {
+	allowed, _ := l.Admit(principalID)
+	return allowed
+}
+
+// Admit is like Allow. It also tells whether this call is the first refused
+// call of the principal in the window, so that the caller can log it once.
+func (l *RefusedLimiter) Admit(principalID string) (allowed, firstDrop bool) {
 	t := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -57,14 +66,16 @@ func (l *RefusedLimiter) Allow(principalID string) bool {
 		l.windows[principalID] = w
 		l.evict(t)
 	case t.Sub(w.start) >= RefusedWindow:
-		w.start, w.count = t, 0
+		w.start, w.count, w.dropLogged = t, 0, false
 		l.order.MoveToBack(w.elem)
 	}
 	if w.count >= l.limit {
-		return false
+		first := !w.dropLogged
+		w.dropLogged = true
+		return false, first
 	}
 	w.count++
-	return true
+	return true, false
 }
 
 // evict removes the windows that ended, and then the oldest windows while the

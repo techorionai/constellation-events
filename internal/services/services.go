@@ -239,13 +239,9 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 	if err != nil {
 		return nil, fmt.Errorf("make the audit writer: %w", err)
 	}
-	refusedLimit := cfg.Audit.RefusedLimitPerMinute
-	if refusedLimit == 0 {
-		refusedLimit = config.DefaultRefusedLimitPerMinute
-	}
 	register, err := commands.NewRegisterEventTypes(commands.Deps{
 		Repo: repo, Tx: txpg.NewTransactor(a.db.Pool), Writer: writer,
-		Limiter: commands.NewRefusedLimiter(refusedLimit, nil),
+		Limiter: commands.NewRefusedLimiter(cfg.Audit.RefusedLimitPerMinute, nil),
 		Notify:  relay.Notify, Log: log, Now: o.clock,
 	})
 	if err != nil {
