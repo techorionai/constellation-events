@@ -428,7 +428,7 @@ func (a *App) startAudit(ctx context.Context, o options) (*outbox.Relay, error) 
 	if err != nil {
 		return nil, fmt.Errorf("make the audit outbox store: %w", err)
 	}
-	pub := streamsvk.NewPublisher(a.kv.Raw, "events", streamsvk.WithFamily(streams.Audit), streamsvk.WithLogger(a.log))
+	pub := streamsvk.NewPublisher(a.kv.Raw, "events", streamsvk.WithFamily(streams.Audit))
 	relay, err := outbox.NewRelay(store, pub, outbox.RelayOptions{Name: "audit", Logger: a.log})
 	if err != nil {
 		return nil, fmt.Errorf("make the audit relay: %w", err)

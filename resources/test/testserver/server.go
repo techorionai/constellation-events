@@ -51,8 +51,8 @@ func WithMeterProvider(mp metric.MeterProvider) Option { return func(s *settings
 func WithLagInterval(d time.Duration) Option { return func(s *settings) { s.lagInterval = d } }
 
 // WithValkeyACL makes the service connect with an ACL user that has the key
-// pattern ~events:*, the two stream selectors, and the two audit producer
-// selectors of platform-go, as in production. Server.ValkeyUser is the name of the user.
+// pattern ~events:*, the two stream selectors, and the audit producer selector
+// of platform-go, as in production. Server.ValkeyUser is the name of the user.
 func WithValkeyACL() Option { return func(s *settings) { s.valkeyACL = true } }
 
 // WithConfigure changes the config before the service starts.

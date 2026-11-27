@@ -412,8 +412,8 @@ func (e *Env) ValkeyAdmin(t testing.TB) valkeygo.Client {
 }
 
 // ACLSelectors returns the ACL selectors of the user of the events service as
-// separate texts, each in parentheses: the two stream selectors and the two
-// audit producer selectors of platform-go.
+// separate texts, each in parentheses: the two stream selectors and the audit
+// producer selector of platform-go.
 func ACLSelectors() []string {
 	re := regexp.MustCompile(`\([^)]*\)`)
 	out := re.FindAllString(streamsvalkey.ACLSelectors("events"), -1)
@@ -422,8 +422,8 @@ func ACLSelectors() []string {
 
 // NewValkeyACLUser makes an ACL user like the user of the events service in
 // production. It has the key pattern ~events:*, the command rule of
-// platform-go, and the two stream selectors. It returns the name and the
-// password.
+// platform-go, the two stream selectors, and the audit producer selector. It
+// returns the name and the password.
 func (e *Env) NewValkeyACLUser(t testing.TB) (string, string) {
 	t.Helper()
 	e.mu.Lock()

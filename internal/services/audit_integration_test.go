@@ -408,3 +408,49 @@ func TestAudit_I10_RefusedLimit(t *testing.T) {
 		}
 	}
 }
+
+// I11: with platform-go v0.9.0, the audit publisher sends no index command. The
+// ACL user of the service cannot write the old index or the trusted set
+// audit.apps. No warn record comes from the publisher.
+func TestAudit_I11_NoIndexCommand(t *testing.T) {
+	logger, capture := testserver.NewLogCapture()
+	srv := started(t, testserver.WithLogger(logger), testserver.WithValkeyACL())
+	reader := newAuditReader(t)
+	registerOK(t, srv, "helpdesk-svc", "helpdesk", newType("helpdesk.ticket.indexed"))
+	if got := reader.wait(1); len(got) != 1 || got[0].Data.Result != "success" {
+		t.Fatalf("entries = %+v", got)
+	}
+
+	admin := env.ValkeyAdmin(t)
+	for _, key := range []string{"audit.streams", "audit.apps"} {
+		n, err := admin.Do(context.Background(), admin.B().Exists().Key(key).Build()).AsInt64()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("EXISTS %s = %d, want 0", key, n)
+		}
+	}
+
+	cfg := srv.Config.Valkey
+	user, err := valkeygo.NewClient(valkeygo.ClientOption{
+		InitAddress: []string{cfg.Address}, Username: srv.ValkeyUser, Password: cfg.Password.Reveal(), DisableCache: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(user.Close)
+	for _, args := range [][]string{
+		{"SADD", "audit.streams", "events"},
+		{"SADD", "audit.apps", "events"},
+		{"SREM", "audit.apps", "events"},
+	} {
+		err := user.Do(context.Background(), user.B().Arbitrary(args[0]).Args(args[1:]...).Build()).Error()
+		if err == nil || !strings.Contains(err.Error(), "NOPERM") {
+			t.Fatalf("%s %s: error = %v, want NOPERM", args[0], args[1], err)
+		}
+	}
+	if text := capture.Text(); strings.Contains(text, `"level":"WARN"`) {
+		t.Fatalf("the capture has a warn record: %s", text)
+	}
+}
