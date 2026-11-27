@@ -77,6 +77,19 @@ The schemas keep the text of their numbers.
 
 The service publishes this manifest to identity at start. Identity gives a service client the scopes of its roles only.
 
-## Audit log
+## Audit entries
 
-A change writes one log record at the info level with the action `events:event_type:register`. The record has the principal, the app, the version, the result (`changed`, `invalid`, or `denied`), the count of types, and the counts of the added, removed, and modified types. An unchanged registration writes no record. After the outbox of the events service exists (R09), an audit entry replaces the record.
+A registration writes audit entries with the `platform-go` audit outbox. An entry has the action `events:event_type:register`, the target type `registration`, and the target ID of the app. The actor is the verified principal of the request. The service never sets the actor.
+
+| Result | When | Summary | `details` |
+| ------ | ---- | ------- | --------- |
+| `success` | A registration changes the catalog. An unchanged registration writes no entry. | `Event types of app <app> registered, version <version>` | `version`, `eventTypeCount`, `addedCount`, `removedCount`, `modifiedCount`, the lists `added`, `removed`, and `modified`, and the flags `addedTruncated`, `removedTruncated`, and `modifiedTruncated`. |
+| `invalid` | The service refuses the request with 422. | `Registration of event types refused` | `code`: `registration_app_mismatch`, `limit_exceeded`, or the code of the first field error. |
+| `denied` | The token has not the scope `events:event_type:register`. The response is 403. | `Registration of event types denied` | `code`: `forbidden`. |
+
+- The entry of a `success` result is in the transaction of the registration. If the audit write fails, the registration rolls back. A database error gives 503 `unavailable` with `Retry-After: 5`. A rule error of the writer gives 500 `internal_error`.
+- The entry of an `invalid` or `denied` result is in a short transaction of its own. If the write fails, the response keeps its 4xx status, and the service writes an error log record with the error type.
+- Each list has a maximum of 30 type names, in the order of the type. A flag is `true` only when its list has more names than the limit. The counts are always complete.
+- The target ID of a refused entry is the app of the path only when it is a valid app key. Else the entry has no `target`, and `details` has `appValid` `false`.
+- An entry has no JSON Schema, no description, and no text of the schema compiler.
+- Each principal can write a maximum of 30 entries of the results `invalid` and `denied` in each minute (`EVENTS_AUDIT__REFUSED_LIMIT_PER_MINUTE`). Over the limit, the request keeps its 4xx response, the service writes no entry, and the counter `constellation.events.audit.refused_dropped` increments. The limit is in the process, so N replicas give a maximum of N times the limit.
