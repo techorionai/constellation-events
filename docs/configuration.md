@@ -34,14 +34,23 @@ The service stops at start with a message that names the variable when a rule fa
 
 ## The Valkey user
 
-The Valkey user of the events service needs the key pattern `~events:*`, the two stream selectors from `ACLSelectors("events")`, and the two audit producer selectors from `AuditProducerSelectors("events")` of `platform-go`:
+The Valkey user of the events service needs the key pattern `~events:*`, the two stream selectors from `ACLSelectors("events")`, and the audit producer selector from `AuditProducerSelectors("events")` of `platform-go`:
 
 ```txt
 (~audit.stream:events +xadd +xtrim)
-(~audit.streams +sadd)
 ```
 
-The `constellation-deploy` install gives these selectors. Give them before you start the image `0.2.0`. The service cannot read any audit stream.
+The `constellation-deploy` install gives these selectors. Give them before you start the image. The service cannot read any audit stream. The service sends no command to an audit index.
+
+The audit service reads only the audit streams of the apps in the trusted set `audit.apps`. Only the provisioner writes this set. As the Valkey admin, register the events service:
+
+```txt
+SADD audit.apps events
+```
+
+If `events` is not in `audit.apps`, the audit service does not read the audit stream of the events service. The entries stay in the stream until the retention job trims them.
+
+The image `0.2.0` uses `platform-go` `v0.7.0`. It sends `SADD audit.streams events` and needs the second selector `(~audit.streams +sadd)`. Keep that selector until no image `0.2.0` runs. Later images do not need it. See the section "Upgrade from v0.8.0 to v0.9.0" in `docs/usage.md` of `platform-go` for the order of the steps.
 
 ## Commands
 
